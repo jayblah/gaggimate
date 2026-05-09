@@ -11,6 +11,7 @@
 GaggiMateController::GaggiMateController(String version) : _version(std::move(version)) {
     configs.push_back(GM_STANDARD_REV_1X);
     configs.push_back(GM_STANDARD_REV_2X);
+    configs.push_back(GM_STANDARD_REV_3X);
     configs.push_back(GM_PRO_REV_1x);
     configs.push_back(GM_PRO_LEGO);
     configs.push_back(GM_PRO_REV_11);
@@ -74,17 +75,15 @@ void GaggiMateController::setup() {
         pressureSensor->setup();
         _ble.registerPressureScaleCallback([this](float scale) { this->pressureSensor->setScale(scale); });
     }
-   // Set up thermal feedforward for main heater if pressure/dimming capability exists
+    // Set up thermal feedforward for main heater if pressure/dimming capability exists
     if (heater && _config.capabilites.dimming && _config.capabilites.pressure) {
         auto dimmedPump = static_cast<DimmedPump *>(pump);
-        float* pumpFlowPtr = dimmedPump->getPumpFlowPtr();
-        int* valveStatusPtr = dimmedPump->getValveStatusPtr();
-        
+        float *pumpFlowPtr = dimmedPump->getPumpFlowPtr();
+        int *valveStatusPtr = dimmedPump->getValveStatusPtr();
+
         heater->setThermalFeedforward(pumpFlowPtr, 23.0f, valveStatusPtr);
         heater->setFeedforwardScale(0.0f);
-        
-
-    } 
+    }
     // Initialize last ping time
     lastPingTime = millis();
 
@@ -122,12 +121,11 @@ void GaggiMateController::setup() {
             dimmedPump->setValveState(valve);
         });
     _ble.registerAltControlCallback([this](bool state) { this->alt->set(state); });
-    _ble.registerPidControlCallback([this](float Kp, float Ki, float Kd, float Kf) { 
-        this->heater->setTunings(Kp, Ki, Kd); 
-        
+    _ble.registerPidControlCallback([this](float Kp, float Ki, float Kd, float Kf) {
+        this->heater->setTunings(Kp, Ki, Kd);
+
         // Apply thermal feedforward parameters if available
         this->heater->setFeedforwardScale(Kf);
-
     });
     _ble.registerPumpModelCoeffsCallback([this](float a, float b, float c, float d) {
         if (_config.capabilites.dimming) {
@@ -158,27 +156,43 @@ void GaggiMateController::loop() {
         handlePingTimeout();
     }
     sendSensorData();
+    if (errorState != ERROR_CODE_NONE) {
+        ESP_LOGW("GaggiMateController", "Error state: %d", errorState);
+    }
     delay(250);
+    if (Serial.available()) {
+        while (Serial.available()) {
+            char c = Serial.read();
+            handleSerialCommand(c);
+        }
+    }
 }
 
 void GaggiMateController::registerBoardConfig(ControllerConfig config) { configs.push_back(config); }
 
 void GaggiMateController::detectBoard() {
+    constexpr int MAX_DETECT_RETRIES = 3;
     pinMode(DETECT_EN_PIN, OUTPUT);
     pinMode(DETECT_VALUE_PIN, INPUT_PULLDOWN);
-    digitalWrite(DETECT_EN_PIN, HIGH);
-    uint16_t millivolts = analogReadMilliVolts(DETECT_VALUE_PIN);
-    digitalWrite(DETECT_EN_PIN, LOW);
-    int boardId = round(((float)millivolts) / 100.0f - 0.5f);
-    ESP_LOGI(LOG_TAG, "Detected Board ID: %d", boardId);
-    for (ControllerConfig config : configs) {
-        if (config.autodetectValue == boardId) {
-            _config = config;
-            ESP_LOGI(LOG_TAG, "Using Board: %s", _config.name.c_str());
-            return;
+
+    for (int attempt = 0; attempt < MAX_DETECT_RETRIES; attempt++) {
+        digitalWrite(DETECT_EN_PIN, HIGH);
+        delay(10); // Allow voltage to stabilize before ADC read
+        uint16_t millivolts = analogReadMilliVolts(DETECT_VALUE_PIN);
+        digitalWrite(DETECT_EN_PIN, LOW);
+        int boardId = round(((float)millivolts) / 100.0f - 0.5f);
+        ESP_LOGI(LOG_TAG, "Board detect attempt %d/%d: ID=%d (raw: %d mV)", attempt + 1, MAX_DETECT_RETRIES, boardId, millivolts);
+        for (ControllerConfig config : configs) {
+            if (config.autodetectValue == boardId) {
+                _config = config;
+                ESP_LOGI(LOG_TAG, "Using Board: %s", _config.name.c_str());
+                return;
+            }
         }
+        ESP_LOGW(LOG_TAG, "No match on attempt %d, retrying...", attempt + 1);
+        delay(500);
     }
-    ESP_LOGW(LOG_TAG, "No compatible board detected.");
+    ESP_LOGE(LOG_TAG, "No compatible board detected after %d attempts. Restarting...", MAX_DETECT_RETRIES);
     delay(5000);
     ESP.restart();
 }
@@ -226,5 +240,48 @@ void GaggiMateController::sendSensorData() {
         }
     } else {
         _ble.sendSensorData(this->thermocouple->read(), 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+void GaggiMateController::handleSerialCommand(char c) {
+    if (c == 'S') {
+        ESP_LOGI("Controller", "");
+        ESP_LOGI("Controller", "╔════════════════╗");
+        ESP_LOGI("Controller", "║ Status Summary ║");
+        ESP_LOGI("Controller", "╠════════════════╝");
+        ESP_LOGI("Controller", "║");
+        ESP_LOGI("Controller", "╠═ Error codes");
+        ESP_LOGI("Controller", "║  ├─ Controller Error: %d", errorState);
+        ESP_LOGI("Controller", "║  └─ Thermocouple Error: %d", thermocouple->isErrorState());
+        ESP_LOGI("Controller", "║");
+        ESP_LOGI("Controller", "╠═ Readings");
+        if (_config.capabilites.pressure) {
+            auto dimmedPump = static_cast<DimmedPump *>(pump);
+            ESP_LOGI("Controller", "║  ├─ Pressure: %.2f", pressureSensor->getPressure());
+            ESP_LOGI("Controller", "║  ├─ Flow: %.2f", dimmedPump->getPumpFlow());
+            ESP_LOGI("Controller", "║  ├─ Pump Power: %.2f", dimmedPump->getPowerTarget());
+        }
+        ESP_LOGI("Controller", "║  └─ Temperature: %.2f", thermocouple->read());
+        ESP_LOGI("Controller", "║");
+        ESP_LOGI("Controller", "╠═ Control");
+        if (_config.capabilites.pressure) {
+            auto dimmedPump = static_cast<DimmedPump *>(pump);
+            ESP_LOGI("Controller", "║  ├─ Pressure: %.2f", dimmedPump->getPressureTarget());
+            ESP_LOGI("Controller", "║  ├─ Flow: %.2f", dimmedPump->getFlowTarget());
+            ESP_LOGI("Controller", "║  ├─ Pump Power: %.2f", dimmedPump->getPowerTarget());
+        }
+        ESP_LOGI("Controller", "║  └─ Temperature: %.2f", heater->getSetpoint());
+        ESP_LOGI("Controller", "║");
+
+        size_t free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
+        size_t total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
+        float fragmentation = 100 - (largest * 100) / free;
+        ESP_LOGI("Controller", "╠═ Memory");
+        ESP_LOGI("Controller", "║  ├─ Heap: %d / %d (%.2f%%)", (total - free), total, (100.0f * (total - free)) / total);
+        ESP_LOGI("Controller", "║  └─ Fragmentation: %.2f%%", fragmentation);
+        ESP_LOGI("Controller", "");
+    } else {
+        ESP_LOGI("Controller", "Unrecognized Input! Available commands: S (Status)");
     }
 }
